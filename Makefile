@@ -9,7 +9,7 @@ EXTRACTED := $(WORKDIR)/extracted
 UNPACKED := $(WORKDIR)/unpacked
 STATE := $(WORKDIR)/target.txt
 
-.PHONY: help setup reverse hook analyze repack clean
+.PHONY: help setup reverse hook analyze analyze_native repack clean
 
 help:
 	@echo "Targets:"
@@ -32,6 +32,9 @@ hook:
 
 analyze:
 	$(NODE) scripts/modium/analyze.js
+
+analyze_native:
+	$(NODE) scripts/modium/analyze_native.js
 
 repack:
 	bash scripts/modium/repack.sh
