@@ -19,6 +19,7 @@ help:
 	@echo "  analyze             Static scan endpoints/ipc and export JSON"
 	@echo "  repack              Repack unpacked directory back into app.asar"
 	@echo "  clean               Remove reverse workspace"
+	@echo "  cli                 Run automation CLI (see scripts/modium/cli.js)"
 
 setup:
 	$(NPM) install --silent
@@ -38,6 +39,9 @@ analyze_native:
 
 repack:
 	bash scripts/modium/repack.sh
+
+cli:
+	node scripts/modium/cli.js --help
 
 clean:
 	rm -rf $(WORKDIR)
