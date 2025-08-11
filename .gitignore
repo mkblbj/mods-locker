@@ -4,3 +4,7 @@
 .bmad-infrastructure-devops
 .cursor
 web-bundles
+modium/
+
+#依赖
+node_modules/
