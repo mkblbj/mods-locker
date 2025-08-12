@@ -100,6 +100,20 @@ async function main() {
     return await done.catch(e=>({error:e}));
   };
 
+  // Some endpoints (like installed_mods) stream via plugin:// and never resolve the callback.
+  // Provide a quick, timeout-raced variant so callers never hang the DevTools evaluation.
+  window.__tauriSendQuick = async function(endpoint, body, timeoutMs){
+    const ms = Number(timeoutMs ?? 800);
+    try {
+      const p = window.__tauriSend(endpoint, body);
+      const t = new Promise(resolve => setTimeout(() => resolve('__timeout__'), ms));
+      const r = await Promise.race([p, t]);
+      return r === '__timeout__' ? null : r;
+    } catch (e) {
+      return null;
+    }
+  };
+
   window.__setDisabledReal = async function(modId, disabled, gameId){ return await window.__tauriSend('mod/set_disabled', { gameId, modId, disabled }); };
   window.__applyChanges = async function(gameId){ try{ await window.__tauriSend('mod/update_modded_files', { gameId }); }catch(e){} try{ await window.__tauriSend('game/sync_status', { gameId }); }catch(e){} };
   // relaxed collector
@@ -114,13 +128,30 @@ async function main() {
   })();
   // list helper
   window.__listInstalled = async function(gameId,pageSize){
-    try{ const r=await window.__tauriSend('mod/installed_mods',{gameId,current:1,size:pageSize,sort:'priority:desc,installed_at:desc'}); const arr=(r?.data?.list||r?.list||r?.items)||[]; if(arr.length) return arr; }catch(e){}
-    const b=window.__mods_relax.hits; try{ await window.__tauriSend('mod/installed_mods',{gameId,current:1,size:pageSize,sort:'priority:desc,installed_at:desc'});}catch(e){}
-    const d=Date.now()+6000; while(window.__mods_relax.hits===b && Date.now()<d){ await new Promise(r=>setTimeout(r,200)); }
+    // Try direct callback path first, but never hang
+    try{
+      const r = await window.__tauriSendQuick('mod/installed_mods', {gameId,current:1,size:pageSize,sort:'priority:desc,installed_at:desc'}, 800);
+      const arr = (r?.data?.list||r?.list||r?.items)||[];
+      if(Array.isArray(arr) && arr.length) return arr;
+    }catch(e){}
+
+    // Fire-and-forget trigger + wait for relax collector
+    const b = window.__mods_relax.hits;
+    try{ void window.__tauriSendQuick('mod/installed_mods', {gameId,current:1,size:pageSize,sort:'priority:desc,installed_at:desc'}, 300); }catch(e){}
+    const deadline = Date.now()+7000;
+    while(window.__mods_relax.hits===b && Date.now()<deadline){ await new Promise(r=>setTimeout(r,200)); }
     if((window.__mods_relax.list||[]).length) return window.__mods_relax.list;
-    try{ const r2=await window.__tauriSend('mod/installed_mods_for_priority',{gameId}); const arr2=(r2?.data?.list||r2?.list||r2?.items)||[]; if(arr2.length) return arr2; }catch(e){}
-    const b2=window.__mods_relax.hits; try{ await window.__tauriSend('mod/installed_mods_for_priority',{gameId}); }catch(e){}
-    const d2=Date.now()+6000; while(window.__mods_relax.hits===b2 && Date.now()<d2){ await new Promise(r=>setTimeout(r,200)); }
+
+    // Fallback path
+    try{
+      const r2 = await window.__tauriSendQuick('mod/installed_mods_for_priority', {gameId}, 800);
+      const arr2 = (r2?.data?.list||r2?.list||r2?.items)||[];
+      if(Array.isArray(arr2) && arr2.length) return arr2;
+    }catch(e){}
+    const b2 = window.__mods_relax.hits;
+    try{ void window.__tauriSendQuick('mod/installed_mods_for_priority', {gameId}, 300); }catch(e){}
+    const deadline2 = Date.now()+7000;
+    while(window.__mods_relax.hits===b2 && Date.now()<deadline2){ await new Promise(r=>setTimeout(r,200)); }
     return window.__mods_relax.list||[];
   };
 })();
