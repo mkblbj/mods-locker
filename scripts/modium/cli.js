@@ -21,9 +21,12 @@ const argv = yargs(hideBin(process.argv))
   .option('enable', { describe: 'enable mods', type: 'boolean' })
   .option('list', { describe: 'list installed mods (prints JSON)', type: 'boolean' })
   .option('out', { describe: 'output file for list JSON', type: 'string' })
+  .option('sniff-remote', { describe: 'sniff remote HTTP(S) requests (exclude ipc.localhost)', type: 'boolean' })
+  .option('sniff-seconds', { describe: 'sniff duration in seconds', default: 15, type: 'number' })
+  .option('sniff-out', { describe: 'output file for sniffed requests JSON', type: 'string' })
   .option('refresh', { describe: 'try to refresh UI after actions', default: true, type: 'boolean' })
   .check(args => {
-    if (args.list) return true;
+    if (args.list || args['sniff-remote']) return true;
     if (!args.mods) throw new Error('Provide --mods for enable/disable OR use --list');
     if (!(args.disable ^ args.enable)) throw new Error('Specify exactly one of --disable or --enable');
     return true;
@@ -236,7 +239,65 @@ async function main() {
     await new Promise(r=>setTimeout(r,100));
   }
 
-  if (argv.list) {
+  if (argv['sniff-remote']) {
+    const startTs = Date.now();
+    const cut = (s,l=200)=>{ s=String(s||''); return s.length>l? s.slice(0,l)+'…' : s; };
+    const isLocal = (u)=>/ipc\.localhost|plugin%3A|tauri:\/\//i.test(u||'') || /^data:|^chrome:|^devtools:/i.test(u||'');
+    const store = new Map(); // id -> partial
+    const out = [];
+
+    Network.requestWillBeSent(params => {
+      const { requestId, request } = params;
+      const url = String(request?.url || '');
+      if (isLocal(url)) return;
+      store.set(requestId, {
+        id: requestId,
+        ts: Date.now(),
+        method: request?.method,
+        url,
+        requestHeaders: request?.headers || {},
+      });
+    });
+    Network.responseReceived(params => {
+      const it = store.get(params.requestId); if (!it) return;
+      it.status = params.response?.status;
+      it.responseHeaders = params.response?.headers || {};
+      it.mimeType = params.response?.mimeType;
+    });
+    Network.loadingFinished(async params => {
+      const it = store.get(params.requestId); if (!it) return;
+      try {
+        const body = await Network.getResponseBody({ requestId: params.requestId }).catch(()=>null);
+        if (body && body.body) {
+          const text = body.base64Encoded ? Buffer.from(body.body,'base64').toString('utf8') : body.body;
+          // only keep small-ish JSON bodies to avoid huge logs
+          if ((it.mimeType||'').includes('json') && text && text.length <= 200000) {
+            it.responseBodyPreview = cut(text, 10000);
+          }
+        }
+      } catch {}
+      out.push(it);
+      store.delete(params.requestId);
+    });
+
+    // gentle UI nudge to trigger requests
+    try {
+      await evalInPage(`(async()=>{ const sleep=ms=>new Promise(r=>setTimeout(r,ms)); const click=(t)=>{ const n=[...document.querySelectorAll('a,button,[role],div,span')].find(e=>(e.innerText||e.textContent||'').includes(t)); if(n){n.click(); return true;} return false; }; if(click('首页')){ await sleep(120); click('模组库'); } else { click('模组库')||click('Mods'); } })()`);
+    } catch {}
+
+    const until = Date.now() + Math.max(1, Number(argv['sniff-seconds']))*1000;
+    while (Date.now() < until) { await new Promise(r=>setTimeout(r,200)); }
+
+    // finalize
+    const result = out.sort((a,b)=>a.ts-b.ts);
+    if (argv['sniff-out']) {
+      const p = path.resolve(argv['sniff-out']);
+      fs.writeFileSync(p, JSON.stringify(result, null, 2));
+      console.log(`[✓] sniffed ${result.length} requests -> ${p}`);
+    } else {
+      console.log(JSON.stringify(result, null, 2));
+    }
+  } else if (argv.list) {
     let listJson = await evalInPage(`(async()=>{ const l=await window.__listInstalled(${argv.game},200); return JSON.stringify(l); })()`);
     let list = JSON.parse(listJson || '[]');
     // If first attempt yields empty, nudge UI and retry once (no hard reload to avoid breaking Tauri IPC)
