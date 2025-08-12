@@ -57,9 +57,28 @@ async function main() {
   console.log(`[+] Attaching to target: ${target.title} ${target.url}`);
 
   const client = await CDP({ host, port, target: target.id });
-  const { Runtime, Page } = client;
+  const { Runtime, Page, Network } = client;
   await Runtime.enable();
   await Page.enable();
+  await Network.enable();
+
+  // Capture tauri-invoke-key from any real network request headers (Node-side via CDP)
+  let tauriKeyFromNetwork = null;
+  const tryCaptureFromHeaders = (headers) => {
+    if (!headers) return;
+    try {
+      for (const k of Object.keys(headers)) {
+        const v = headers[k];
+        if (String(k).toLowerCase().includes('tauri-invoke-key') && v) {
+          tauriKeyFromNetwork = String(v);
+          break;
+        }
+      }
+    } catch {}
+  };
+  Network.requestWillBeSent((params)=>{ tryCaptureFromHeaders(params.request?.headers||{}); });
+  Network.requestWillBeSentExtraInfo((params)=>{ tryCaptureFromHeaders(params.headers||{}); });
+  Network.responseReceivedExtraInfo((params)=>{ tryCaptureFromHeaders(params.headers||{}); });
 
   // Helper to eval in page and return value
   async function evalInPage(expression) {
@@ -137,6 +156,8 @@ async function main() {
 
     // Fire-and-forget trigger + wait for relax collector
     const b = window.__mods_relax.hits;
+    // try to simulate the UI refresh that user manually clicks
+    try{ if(window.__tryClickRefresh) await window.__tryClickRefresh(); }catch(e){}
     try{ void window.__tauriSendQuick('mod/installed_mods', {gameId,current:1,size:pageSize,sort:'priority:desc,installed_at:desc'}, 300); }catch(e){}
     const deadline = Date.now()+7000;
     while(window.__mods_relax.hits===b && Date.now()<deadline){ await new Promise(r=>setTimeout(r,200)); }
@@ -154,18 +175,77 @@ async function main() {
     while(window.__mods_relax.hits===b2 && Date.now()<deadline2){ await new Promise(r=>setTimeout(r,200)); }
     return window.__mods_relax.list||[];
   };
+
+  // ensure tauri key without relying on raw fetch (which lacks header injection)
+  window.__ensureKey = async function(){
+    const has = ()=> Boolean(window.__TAURI_INVOKE_KEY__);
+    if (has()) return true;
+    // click refresh upfront to trigger any request with headers
+    try{ if(window.__tryClickRefresh) await window.__tryClickRefresh(); }catch{}
+    // Prefer using tauri core.invoke to auto-attach headers
+    for (let i=0; i<5 && !has(); i++) {
+      try { if (window.__TAURI__?.core?.invoke) { await window.__TAURI__.core.invoke('plugin:window|start_dragging', {}); } } catch {}
+      await new Promise(r=>setTimeout(r,200));
+    }
+    if (has()) return true;
+    // Gentle UI nudge to produce any IPC
+    try {
+      const clickByText=(re)=>{ const el=[...document.querySelectorAll('a,button,[role],div,span')].find(e=>re.test((e.innerText||e.textContent||'').trim())); if(el){ el.click(); return true;} return false; };
+      clickByText(/模组库|模組庫|Mods|库/);
+      await new Promise(r=>setTimeout(r,400));
+    } catch {}
+    return has();
+  };
+
+  // best-effort click of page refresh control (text/title/aria-label contains 刷新/Refresh)
+  window.__tryClickRefresh = async function(){
+    const qs = 'a,button,[role="button"],div,span';
+    const cand = [...document.querySelectorAll(qs)].filter(e=>{
+      const t=(e.innerText||e.textContent||'').trim();
+      const title=e.getAttribute?.('title')||'';
+      const aria=e.getAttribute?.('aria-label')||'';
+      return /刷新|Refresh|更新/.test(t)||/刷新|Refresh|更新/.test(title)||/刷新|Refresh|更新/.test(aria);
+    });
+    if(cand.length){ cand[0].click(); await new Promise(r=>setTimeout(r,200)); }
+  };
 })();
   `;
-  await evalInPage(bootstrap);
+  async function __inject(){
+    return await evalInPage(bootstrap);
+  }
+  await __inject();
 
-  // First poke to obtain key (ask page to do a harmless request)
-  try { await evalInPage(`fetch('http://ipc.localhost/plugin%3Awindow%7Cstart_dragging',{method:'POST',body:'{}'})`); } catch {}
-  // short wait for key capture
-  await new Promise(r=>setTimeout(r,300));
+  // Function: push captured key into the page once we see it via CDP
+  async function pushKeyIntoPageIfAny(){
+    if (!tauriKeyFromNetwork) return false;
+    try { await evalInPage(`window.__TAURI_INVOKE_KEY__=${JSON.stringify(tauriKeyFromNetwork)}`); return true; } catch { return false; }
+  }
+
+  // Nudge UI navigation to trigger at least one real IPC (so CDP can see headers)
+  try {
+    await evalInPage(`(async()=>{ const sleep=ms=>new Promise(r=>setTimeout(r,ms)); const click=(t)=>{ const n=[...document.querySelectorAll('a,button,[role],div,span')].find(e=>(e.innerText||e.textContent||'').includes(t)); if(n){n.click(); return true;} return false; }; if(click('首页')){ await sleep(150); click('模组库'); } else { click('模组库')||click('Mods'); } })()`);
+  } catch {}
+
+  // Ensure tauri invoke key is captured (without causing 500)
+  try { await evalInPage(`window.__ensureKey && window.__ensureKey()`); } catch {}
+
+  // Wait briefly for CDP to see a request and push key into page
+  const keyWaitDeadline = Date.now()+2000;
+  while (Date.now() < keyWaitDeadline) {
+    if (await pushKeyIntoPageIfAny()) break;
+    await new Promise(r=>setTimeout(r,100));
+  }
 
   if (argv.list) {
-    const listJson = await evalInPage(`(async()=>{ const l=await window.__listInstalled(${argv.game},200); return JSON.stringify(l); })()`);
-    const list = JSON.parse(listJson || '[]');
+    let listJson = await evalInPage(`(async()=>{ const l=await window.__listInstalled(${argv.game},200); return JSON.stringify(l); })()`);
+    let list = JSON.parse(listJson || '[]');
+    // If first attempt yields empty, nudge UI and retry once (no hard reload to avoid breaking Tauri IPC)
+    if (!Array.isArray(list) || list.length === 0) {
+      try { await evalInPage(`window.__tryClickRefresh && window.__tryClickRefresh()`); } catch {}
+      try { await evalInPage(`window.__ensureKey && window.__ensureKey()`); } catch {}
+      listJson = await evalInPage(`(async()=>{ const l=await window.__listInstalled(${argv.game},200); return JSON.stringify(l); })()`);
+      list = JSON.parse(listJson || '[]');
+    }
     if (argv.out) {
       const outPath = path.resolve(argv.out);
       fs.writeFileSync(outPath, JSON.stringify(list, null, 2));
