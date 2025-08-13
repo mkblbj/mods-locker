@@ -5,6 +5,8 @@
 .cursor
 web-bundles
 /modium/
+reverse/
+scripts/
 
 #依赖
 node_modules/
