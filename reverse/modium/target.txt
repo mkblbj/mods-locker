@@ -1,1 +1,0 @@
-DIR /root/dev/mods-locker/modium
